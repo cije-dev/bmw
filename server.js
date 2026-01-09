@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');  // Changed from mysql2
 const bcrypt = require('bcrypt');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -16,17 +16,15 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const dbConfig = {
+// PostgreSQL Connection Pool
+const pool = new Pool({
     host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 3306,
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
+    port: process.env.DB_PORT || 5432,
+    user: process.env.DB_USER || 'bmw_db_user',
+    password: process.env.DB_PASSWORD || '8pgCkc3EU46plq9DQVS9NyVMiWedDiYK',
     database: process.env.DB_NAME || 'bmw_db',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : null
-};
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 const raWellness = [
     {id:1, activity: 'Physical activity (e.g., walking or exercise)', source: 'NHS exercise guidelines', priority: '["high","moderate"]'},
@@ -37,39 +35,44 @@ const raWellness = [
     {id:6, activity: 'Healthy eating', source: 'APA nutrition info', priority: '["high"]'}
 ];
 
-async function getDb() {
-    return await mysql.createConnection(dbConfig);
-}
-
+// Initialize Database Tables
 async function initDb() {
     try {
-        const db = await getDb();
-        await db.execute('CREATE DATABASE IF NOT EXISTS bmw_db');
-        await db.execute('USE bmw_db');
+        const client = await pool.connect();
+        
+        // Create users table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                scores JSONB DEFAULT '[]'::jsonb,
+                created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
 
-        await db.execute(`CREATE TABLE IF NOT EXISTS users (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            email VARCHAR(255) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL,
-            name VARCHAR(255) NOT NULL,
-            scores JSON DEFAULT '[]',
-            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`);
+        // Create ra_wellness table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS ra_wellness (
+                id INTEGER PRIMARY KEY,
+                activity TEXT NOT NULL,
+                source TEXT NOT NULL,
+                priority JSONB NOT NULL
+            )
+        `);
 
-        await db.execute(`CREATE TABLE IF NOT EXISTS ra_wellness (
-            id INT PRIMARY KEY,
-            activity TEXT NOT NULL,
-            source TEXT NOT NULL,
-            priority JSON NOT NULL
-        )`);
-
+        // Seed ra_wellness data
         for (let activity of raWellness) {
-            await db.execute(
-                'INSERT IGNORE INTO ra_wellness (id, activity, source, priority) VALUES (?, ?, ?, ?)',
+            await client.query(
+                `INSERT INTO ra_wellness (id, activity, source, priority) 
+                 VALUES ($1, $2, $3, $4) 
+                 ON CONFLICT (id) DO NOTHING`,
                 [activity.id, activity.activity, activity.source, activity.priority]
             );
         }
-        db.end();
+
+        client.release();
         console.log('✅ Database initialized');
     } catch (error) {
         console.error('❌ DB Init failed:', error);
@@ -80,14 +83,14 @@ async function initDb() {
 app.post('/api/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
-        const db = await getDb();
         const hashed = await bcrypt.hash(password, 12);
-        await db.execute(
-            'INSERT INTO users (email, password, name) VALUES (LOWER(?), ?, ?)',
-            [email, hashed, name]
+        
+        const result = await pool.query(
+            'INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id, name, email',
+            [email.toLowerCase(), hashed, name]
         );
-        db.end();
-        res.json({ success: true, message: 'Account created' });
+        
+        res.json({ success: true, user: result.rows[0] });
     } catch (err) {
         res.status(400).json({ error: 'Email already exists' });
     }
@@ -96,11 +99,9 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const db = await getDb();
-        const [rows] = await db.execute('SELECT * FROM users WHERE LOWER(email) = LOWER(?)', [email]);
-        const user = rows[0];
-        db.end();
-
+        const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+        const user = result.rows[0];
+        
         if (user && await bcrypt.compare(password, user.password)) {
             res.json({
                 success: true,
@@ -108,7 +109,7 @@ app.post('/api/login', async (req, res) => {
                     id: user.id,
                     name: user.name,
                     email: user.email,
-                    scores: JSON.parse(user.scores || '[]')
+                    scores: user.scores || []
                 }
             });
         } else {
@@ -121,10 +122,11 @@ app.post('/api/login', async (req, res) => {
 
 app.get('/api/profile/:id', async (req, res) => {
     try {
-        const db = await getDb();
-        const [rows] = await db.execute('SELECT id, name, email, scores FROM users WHERE id = ?', [req.params.id]);
-        res.json(rows[0] || {});
-        db.end();
+        const result = await pool.query(
+            'SELECT id, name, email, scores FROM users WHERE id = $1',
+            [req.params.id]
+        );
+        res.json(result.rows[0] || {});
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -133,12 +135,15 @@ app.get('/api/profile/:id', async (req, res) => {
 app.post('/api/score/:id', async (req, res) => {
     try {
         const { score } = req.body;
-        const db = await getDb();
-        const [userRows] = await db.execute('SELECT scores FROM users WHERE id = ?', [req.params.id]);
-        const scores = JSON.parse(userRows[0]?.scores || '[]');
+        const userResult = await pool.query('SELECT scores FROM users WHERE id = $1', [req.params.id]);
+        const scores = userResult.rows[0]?.scores || [];
         scores.push(score);
-        await db.execute('UPDATE users SET scores = ? WHERE id = ?', [JSON.stringify(scores), req.params.id]);
-        db.end();
+        
+        await pool.query(
+            'UPDATE users SET scores = $1 WHERE id = $2',
+            [JSON.stringify(scores), req.params.id]
+        );
+        
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -149,13 +154,14 @@ app.get('/api/plan/:score', async (req, res) => {
     try {
         const score = parseInt(req.params.score);
         const level = score >= 10 ? 'high' : score >= 5 ? 'moderate' : 'low';
-        const db = await getDb();
-        const [rows] = await db.execute(
-            'SELECT * FROM ra_wellness WHERE JSON_OVERLAPS(priority, ?) OR JSON_CONTAINS(priority, ?)',
-            [JSON.stringify([level]), JSON.stringify('all')]
+        
+        const result = await pool.query(
+            `SELECT * FROM ra_wellness 
+             WHERE priority @> $1 OR priority @> $2`,
+            [JSON.stringify([level]), JSON.stringify(['all'])]
         );
-        db.end();
-        const recs = rows.slice(0, 3);
+        
+        const recs = result.rows.slice(0, 3);
         res.json({
             recommendations: recs,
             fullTable: raWellness,
@@ -177,3 +183,5 @@ app.listen(port, async () => {
     console.log(`Platform: ${os.platform()}`);
     if (process.env.INIT_DB === 'true') await initDb();
 });
+
+module.exports = app;
