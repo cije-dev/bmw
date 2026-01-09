@@ -5,8 +5,7 @@ module.exports = {
     instances: 'max',
     exec_mode: 'cluster',
     env: {
-      NODE_ENV: 'development',
-      INIT_DB: 'true'
+      NODE_ENV: 'development'
     },
     env_production: {
       NODE_ENV: 'production'
